@@ -1,0 +1,149 @@
+name: Deploy with VPN (L2TP/IPSec)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: composer
+          coverage: none
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.18.0
+          cache: 'npm'
+
+      - name: Install Node Dependencies
+        run: npm install
+
+      - name: Build Assets
+        run: npm run build
+
+      - name: Cache Composer Dependencies
+        id: composer-cache
+        uses: actions/cache@v3
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer Dependencies
+        if: steps.composer-cache.outputs.cache-hit != 'true'
+        run: composer install --no-dev --optimize-autoloader
+
+      - name: Install Required Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y systemd strongswan xl2tpd lsof iputils-ping rsync
+
+      - name: Configure IPSec
+        run: |
+          echo "config setup" | sudo tee /etc/ipsec.conf
+          echo "  charondebug=\"ike 2, knl 2, cfg 2\"" | sudo tee -a /etc/ipsec.conf
+          echo "conn L2TP-PSK" | sudo tee -a /etc/ipsec.conf
+          echo "  authby=secret" | sudo tee -a /etc/ipsec.conf
+          echo "  ike=aes256-sha1-modp1024!" | sudo tee -a /etc/ipsec.conf
+          echo "  esp=aes256-sha1!" | sudo tee -a /etc/ipsec.conf
+          echo "  keyexchange=ikev1" | sudo tee -a /etc/ipsec.conf
+          echo "  left=%defaultroute" | sudo tee -a /etc/ipsec.conf
+          echo "  leftprotoport=17/1701" | sudo tee -a /etc/ipsec.conf
+          echo "  right=${{ secrets.VPN_SERVER }}" | sudo tee -a /etc/ipsec.conf
+          echo "  rightprotoport=17/1701" | sudo tee -a /etc/ipsec.conf
+          echo "  auto=start" | sudo tee -a /etc/ipsec.conf
+          echo "${{ secrets.VPN_SERVER }} %any : PSK \"${{ secrets.VPN_SECRET }}\"" | sudo tee /etc/ipsec.secrets
+
+      - name: Configure L2TP
+        run: |
+          echo "[global]" | sudo tee /etc/xl2tpd/xl2tpd.conf
+          echo "port = 1701" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "[lns default]" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "ip range = 192.168.1.10-192.168.1.100" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "local ip = 192.168.1.1" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "require chap = yes" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "refuse pap = yes" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "require authentication = yes" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "name = L2TP-VPN" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "ppp debug = yes" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "pppoptfile = /etc/ppp/options.xl2tpd" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+          echo "length bit = yes" | sudo tee -a /etc/xl2tpd/xl2tpd.conf
+
+      - name: Configure PPP
+        run: |
+          echo "refuse-pap" | sudo tee /etc/ppp/options.xl2tpd
+          echo "require-chap" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "idle 1800" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "mtu 1410" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "mru 1410" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "lock" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "debug" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "name ${VPN_USERNAME}" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "proxyarp" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "connect-delay 5000" | sudo tee -a /etc/ppp/options.xl2tpd
+          echo "${{ secrets.VPN_USERNAME }} * ${VPN_PASSWORD} *" | sudo tee /etc/ppp/chap-secrets
+
+      - name: Start VPN
+        run: |
+          sudo service ipsec restart || echo "Failed to restart ipsec service."
+          sudo service xl2tpd restart || echo "Failed to restart xl2tpd service."
+          echo "c L2TP" > /var/run/xl2tpd/l2tp-control
+          sleep 10
+
+      - name: Wait for VPN Connection
+        run: |
+          for i in {1..5}
+          do
+            if ping -c 1 ${{ secrets.VPN_SERVER }}; then
+              echo "VPN is reachable"
+              break
+            elif [ "$i" -eq "5" ]; then
+              echo "Failed to establish VPN connection after 5 attempts!"
+              exit 1
+            fi
+            echo "Waiting for VPN connection attempt #$i..."
+            sleep 5
+          done
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo '${{ secrets.DEPLOY_KEY }}' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+          {
+            echo "Host *";
+            echo "  HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256";
+            echo "  PubkeyAcceptedAlgorithms +ssh-rsa";
+            echo "  User ${{ secrets.DEPLOY_USER }}";
+            echo "  IdentityFile ~/.ssh/id_rsa";
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+        shell: bash
+
+      - name: Deploy Application
+        run: |
+          rsync -avzH --size-only ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}
+
+      - name: Clear Application Cache
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "cd ${{ secrets.DEPLOY_PATH }} && \
+            php artisan config:cache && \
+            php artisan route:cache && \
+            php artisan view:cache"
+
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          echo "d L2TP" > /var/run/xl2tpd/l2tp-control || echo "Failed to disconnect VPN."
